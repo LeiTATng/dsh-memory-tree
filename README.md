@@ -139,7 +139,9 @@ DSH 原生是线性聊天上下文。本插件在 DSH 之上实现一套**记忆
 | `mt_set_project(name)` | 切换激活项目（记忆树根节点） |
 | `mt_route(message)` | 意图分类 + 隔离路由 + 返回主线上下文 |
 | `mt_branch(title)` | 新开支线，返回 branchId |
-| `mt_merge(branchId,[summary])` | 支线合并入主线并归档 |
+| `mt_merge(branchId,[summary],[force])` | 支线合并入主线并归档（疑似冲突时返回 needsConfirmation，需 mt_merge_resolve 确认） |
+| `mt_merge_resolve(branchId,resolutions,[summary])` | 提交用户对合并冲突的决议（keepBoth/replace/drop） |
+| `mt_search(query,[topK],[project])` | 语义检索全部记忆（轻量本地向量，零依赖） |
 | `mt_checkpoint(title,[review])` | 里程碑复盘，冻结为新基线 |
 | `mt_get_context([maxRecent])` | 取主线上下文注入对话 |
 | `mt_chat(message)` | 闲聊写入隔离分区（激进压缩） |
