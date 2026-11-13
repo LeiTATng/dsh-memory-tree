@@ -49,6 +49,26 @@ out.push('CONTEXT contains 决策? ' + /决策|OAuth2/.test(ctx.result.content[0
 const st = await call('mt_status', {});
 out.push('STATUS: ' + st.result.content[0].text.replace(/\n/g, ' ').slice(0, 200));
 
+// --- 语义检索 ---
+const se = await call('mt_search', { query: 'OAuth 鉴权方案', topK: 3 });
+const seRes = JSON.parse(se.result.content[0].text);
+out.push('SEARCH hits=' + seRes.length + (seRes[0] ? ` top=${seRes[0].score} "${seRes[0].text.slice(0, 18)}"` : ''));
+
+// --- Merge 冲突确认流程 ---
+await call('mt_branch', { title: '鉴权细化' });
+const bl2 = await call('mt_list_branches', {});
+const branchId2 = JSON.parse(bl2.result.content[0].text).filter(b => b.status === 'active').pop().id;
+const conflictSummary = '## 决策\n- 采用 OAuth2 + PKCE 做前端鉴权（补充：access token 存内存不落盘）\n## 结果\n- 输出了中间件骨架';
+const mc = await call('mt_merge', { branchId: branchId2, summary: conflictSummary });
+const mcRes = JSON.parse(mc.result.content[0].text);
+out.push('MERGE needsConfirmation=' + (mcRes.needsConfirmation === true) + (mcRes.conflicts ? ` conflicts=${mcRes.conflicts.length}` : ''));
+if (mcRes.needsConfirmation) {
+  const idx0 = mcRes.conflicts[0].index;
+  const rs = await call('mt_merge_resolve', { branchId: branchId2, summary: conflictSummary, resolutions: [{ index: idx0, action: 'keepBoth' }] });
+  const rsRes = JSON.parse(rs.result.content[0].text);
+  out.push('RESOLVE archived=' + (rsRes.archived === true) + ' appliedConflicts=' + JSON.stringify(rsRes.appliedConflicts || []));
+}
+
 console.log(out.join('\n'));
 srv.kill();
 process.exit(0);
