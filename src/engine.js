@@ -4,6 +4,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
+import { tokenize, tf, cosine, SemanticIndex } from './semantic.js';
+
+const MERGE_CONFLICT_THRESHOLD = 0.5; // 支线新项与主线同类别已存在项的余弦相似度 >= 此值且非精确重复 → 判为冲突，需用户确认
 
 const DEFAULT_IDLE = ['你好', '您好', 'hi', 'hello', '在吗', '在不在', '谢谢', '感谢', '哈哈',
   '哦哦', '好的', '了解', '辛苦了', '早上好', '晚安', '今天', '天气', '吃饭', '早', '晚安咯',
@@ -158,17 +161,89 @@ export class MemoryTree {
   }
 
   // ---------- Merge：支线 → 主线（只存结构化结论，不复制原始聊天）----------
-  mergeBranch(name, id, summary) {
+
+  // 支线新项与主线同类别已存在项的最佳匹配（余弦），用于冲突检测
+  bestMatch(arr, text) {
+    const qv = tf(tokenize(text));
+    let best = null;
+    arr.forEach((existing, i) => {
+      const s = cosine(qv, tf(tokenize(existing)));
+      if (!best || s > best.score) best = { index: i, text: existing, score: s };
+    });
+    return best;
+  }
+  // 检测冲突：支线结论中，与主线同类别已存在项语义高度相似（非完全重复）的，标记为冲突
+  detectMergeConflicts(name, id, summary) {
     const { meta, events } = this.getBranch(name, id);
-    // 若无外部传入的结构化结论，则启发式抽取
     const conclusion = summary || this.heuristicExtract(events);
+    const patch = this.parseStructured(conclusion);
+    const state = this.getMainline(name);
+    const conflicts = [];
+    const clean = { constraints: [], decisions: [], results: [], openQuestions: [] };
+    let ci = 0;
+    for (const k of ['constraints', 'decisions', 'results', 'openQuestions']) {
+      for (const item of (patch[k] || [])) {
+        if (state[k].includes(item)) continue; // 精确重复：静默跳过，不冲突
+        const best = this.bestMatch(state[k], item);
+        if (best && best.score >= MERGE_CONFLICT_THRESHOLD) {
+          conflicts.push({ index: ci++, category: k, newText: item, existingIndex: best.index,
+            existingText: best.text, score: +best.score.toFixed(3), action: null, customText: null });
+        } else {
+          clean[k].push(item);
+        }
+      }
+    }
+    return { meta, conclusion, clean, conflicts };
+  }
+  // 执行合并（写入 conclusion.md + 主线 state + 归档）。conflicts 里带 action/customText 的按决议处理
+  applyMerge(name, id, conclusion, clean, conflicts) {
+    const { meta } = this.getBranch(name, id);
     const md = `# 支线结论：${meta.title}\n\n> 来源支线：${id}\n> 合并时间：${nowISO()}\n\n${conclusion}\n`;
     fs.writeFileSync(path.join(this.branchDir(name, id), 'conclusion.md'), md);
-    // 解析结构化条目，写入主线 state
-    const patch = this.parseStructured(conclusion);
-    this.appendMainline(name, patch);
+    const s = this.getMainline(name);
+    for (const k of ['constraints', 'decisions', 'results', 'openQuestions'])
+      for (const item of clean[k]) if (!s[k].includes(item)) s[k].push(item);
+    const applied = [];
+    for (const c of (conflicts || [])) {
+      const text = (c.customText && c.customText.trim()) ? c.customText.trim() : c.newText;
+      if (c.action === 'drop') { applied.push({ category: c.category, action: 'drop' }); continue; }
+      if (c.action === 'replace') {
+        if (c.existingIndex >= 0 && c.existingIndex < s[c.category].length) s[c.category][c.existingIndex] = text;
+        else if (!s[c.category].includes(text)) s[c.category].push(text);
+        applied.push({ category: c.category, action: 'replace', text });
+      } else { // keepBoth（默认）
+        if (!s[c.category].includes(text)) s[c.category].push(text);
+        applied.push({ category: c.category, action: 'keepBoth', text });
+      }
+    }
+    this.saveMainline(name, s);
     this.archiveBranch(name, id);
-    return { id, title: meta.title, conclusion, patch, archived: true };
+    return { id, title: meta.title, conclusion, appliedClean: clean, appliedConflicts: applied, archived: true };
+  }
+  // 合并入口：检测到冲突且非强制 → 返回 needsConfirmation，不改动主线；否则直接合并
+  mergeBranch(name, id, summary, force = false) {
+    const det = this.detectMergeConflicts(name, id, summary);
+    if (det.conflicts.length && !force) {
+      return { needsConfirmation: true, branchId: id, title: det.meta.title, conclusion: det.conclusion,
+        conflicts: det.conflicts,
+        hint: '向用户逐条展示 conflicts（newText 与 existingText 对比），征询每项选择：keepBoth(保留两者) / replace(用 newText 覆盖 existingIndex 指向的旧项) / drop(丢弃新项)。然后用 mt_merge_resolve 提交决议。若 mt_merge 用了 summary 触发检测，resolve 时务必传相同 summary。' };
+    }
+    return this.applyMerge(name, id, det.conclusion, det.clean, det.conflicts);
+  }
+  // 用户确认后提交决议：resolutions = [{ index, action:'keepBoth'|'replace'|'drop', customText? }]
+  resolveMerge(name, id, resolutions, summary = null) {
+    const det = this.detectMergeConflicts(name, id, summary);
+    if (!det.conflicts.length) return this.applyMerge(name, id, det.conclusion, det.clean, []);
+    const map = new Map((resolutions || []).map(r => [r.index, r]));
+    if (det.conflicts.some(c => !map.has(c.index))) {
+      return { error: 'conflict_mismatch', message: '冲突项与上次检测不一致（支线可能已变动），请重新调用 mt_merge 获取最新 conflicts 再 resolve。' };
+    }
+    for (const c of det.conflicts) {
+      const r = map.get(c.index);
+      c.action = (r && r.action) || 'keepBoth';
+      c.customText = (r && r.customText) || null;
+    }
+    return this.applyMerge(name, id, det.conclusion, det.clean, det.conflicts);
   }
   // 启发式抽取：从支线事件里抓决策/结论/风险相关文本
   heuristicExtract(events) {
@@ -259,6 +334,38 @@ export class MemoryTree {
       }
     }
     return md + recent + '\n\n> 注：支线原始日志默认不注入本上下文窗口；需合并请调用 mt_merge。';
+  }
+
+  // ---------- 语义检索（轻量本地向量，零依赖，覆盖全部项目记忆）----------
+  // 检索范围：主线结构化条目 + 各支线结论(conclusion.md) + 各 Checkpoint 复盘全文
+  semanticSearch(query, topK = 5, project = null) {
+    const idx = new SemanticIndex();
+    const projects = Object.keys(this.config.projects);
+    for (const p of projects) {
+      if (project && p !== project) continue;
+      const s = this.getMainline(p);
+      for (const k of ['constraints', 'decisions', 'results', 'openQuestions'])
+        s[k].forEach((item, i) => idx.add(`main:${p}:${k}:${i}`, p, k, 'mainline', item));
+      // 支线结论
+      const bd = this.branchesDir(p);
+      if (fs.existsSync(bd)) for (const d of fs.readdirSync(bd)) {
+        const cp = path.join(bd, d, 'conclusion.md');
+        if (!fs.existsSync(cp)) continue;
+        for (const ln of fs.readFileSync(cp, 'utf8').split('\n')) {
+          const t = ln.trim().replace(/^[-*]\s*/, '');
+          if (t && !ln.startsWith('#') && !ln.startsWith('>') && t.length > 4) idx.add(`branch:${p}:${d}`, p, 'conclusion', `branch:${d}`, t);
+        }
+      }
+      // Checkpoint 复盘
+      const cd = this.checkpointsDir(p);
+      if (fs.existsSync(cd)) for (const f of fs.readdirSync(cd).filter(f => f.endsWith('.md'))) {
+        for (const ln of fs.readFileSync(path.join(cd, f), 'utf8').split('\n')) {
+          const t = ln.trim().replace(/^[-*]\s*/, '');
+          if (t && !ln.startsWith('#') && !ln.startsWith('>') && t.length > 4) idx.add(`cp:${p}:${f}`, p, 'checkpoint', f, t);
+        }
+      }
+    }
+    return idx.search(query, topK, project);
   }
 
   // ---------- 状态总览 ----------
