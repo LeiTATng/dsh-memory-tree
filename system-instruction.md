@@ -14,6 +14,13 @@
 - 调用 `mt_merge(branchId, summary)`：
   - `summary` 由你负责提炼——把支线对话压缩成结构化 markdown（用 `## 约束 / ## 决策 / ## 结果 / ## 待解` 等小节，每条一行 `- xxx`）。
   - 插件只把结构化结论写入主线 state，原始聊天不进 token。支线随即被归档。
+- **合并冲突需经用户确认**：若 `mt_merge` 返回 `needsConfirmation: true`，说明支线结论与主线同类别已有项语义高度相似（疑似冲突）。此时**不要**擅自合并，必须：
+  1. 把 `conflicts` 逐条展示给用户（每条给出 `newText` 与 `existingText` 的对比）；
+  2. 征询每项的选择：`keepBoth`（保留两者）/ `replace`（用新项覆盖旧项）/ `drop`（丢弃新项）；
+  3. 收集后调用 `mt_merge_resolve(branchId, resolutions)`，其中 `resolutions = [{ index, action, customText? }]`，`index` 取自 conflicts 的 `index`。若 `mt_merge` 用了 `summary`，`resolve` 时传**相同** `summary`。
+
+## 想找历史记忆但忘了落在哪棵子树时
+- 调用 `mt_search(query)`：在主线结构化条目、各支线结论、各 Checkpoint 复盘中做轻量本地语义检索，返回最相关片段及出处（project / type / source / score）。不确定记忆位置时优先用它，而不是盲目翻上下文。
 
 ## 阶段性里程碑
 - 调用 `mt_checkpoint(title, review)` 冻结当前主线为复盘文档并设为新基线，清空本阶段支线引用与最近对话日志。适合「阶段1复盘」「v1 收尾」等节点。
