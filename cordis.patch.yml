@@ -1,0 +1,20 @@
+# dsh-memory-tree bundle patch（发布模板）
+# 复制下面「mcp-manager」段到你 profile 的 cordis.patch.yml 的 mcp-manager.config.servers 下。
+# 注意：DSH GUI 启动不继承 shell PATH，command/args 必须用【绝对路径】指向 node 与 server.js。
+#
+# 把 <NODE_EXE> 换成你的 node.exe 绝对路径（建议用 WorkBuddy 托管的 node 或任意 Node ≥ 18）；
+# 把 <PLUGIN_DIR> 换成本插件 src/server.js 的绝对路径。
+
+- insert:
+    - id: memory-tree
+      name: 'dsh-memory-tree'
+
+- id: mcp-manager
+  config:
+    servers:
+      memory-tree:
+        transport: stdio
+        command: '<NODE_EXE>'
+        args:
+          - '<PLUGIN_DIR>/src/server.js'
+        enabled: true
