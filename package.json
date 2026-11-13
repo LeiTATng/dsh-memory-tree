@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-tree",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "DSH (DeepSeek Harness) 记忆树插件：隔离路由 + 主线/支线记忆树 + Merge + Checkpoint + 三套上下文压缩策略。以零依赖 MCP server 形式运行。",
   "keywords": [
     "deepseek",
