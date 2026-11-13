@@ -32,8 +32,16 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: { title: { type: 'string', description: '支线标题，如 名词调研' }, project: { type: 'string' } } }
   },
   {
-    name: 'mt_merge', description: '把支线合并入主线：提炼结构化结论追加到主线 state（只存结论，不复制原始聊天），并归档该支线。summary 可省略，省略时启发式抽取',
-    inputSchema: { type: 'object', properties: { branchId: { type: 'string' }, project: { type: 'string' }, summary: { type: 'string', description: '可选：由 LLM 预提炼的结构化结论 markdown' } }, required: ['branchId'] }
+    name: 'mt_merge', description: '把支线合并入主线：提炼结构化结论追加到主线 state（只存结论，不复制原始聊天），并归档该支线。若支线结论与主线同类别已有项语义高度相似（疑似冲突），会返回 needsConfirmation 而不改动主线，需用户确认后用 mt_merge_resolve 提交决议。summary 可省略',
+    inputSchema: { type: 'object', properties: { branchId: { type: 'string' }, project: { type: 'string' }, summary: { type: 'string', description: '可选：由 LLM 预提炼的结构化结论 markdown' }, force: { type: 'boolean', description: '可选：true 跳过冲突确认直接合并（不安全，仅非交互场景用）' } }, required: ['branchId'] }
+  },
+  {
+    name: 'mt_merge_resolve', description: '在 mt_merge 返回 needsConfirmation 后，提交用户对冲突项的决议。resolutions 为数组，每项 { index, action: keepBoth|replace|drop, customText? }，index 对应 mt_merge 返回的 conflicts[].index。summary 若曾在 mt_merge 传入，此处需传相同值以保证冲突索引一致',
+    inputSchema: { type: 'object', properties: { branchId: { type: 'string' }, project: { type: 'string' }, resolutions: { type: 'array', description: '[{index,action,customText?}]' }, summary: { type: 'string' } }, required: ['branchId', 'resolutions'] }
+  },
+  {
+    name: 'mt_search', description: '语义检索记忆：在主线结构化条目、各支线结论、各 Checkpoint 复盘中做轻量本地向量检索（中文 bi-gram + 英文词 token + 余弦），返回最相关片段及出处与相似度。当不确定记忆落在哪棵子树、或想跨项目找相关内容时使用。project 可省略（搜全部项目）',
+    inputSchema: { type: 'object', properties: { query: { type: 'string', description: '检索语句，如 鉴权方案' }, topK: { type: 'number', description: '返回条数，默认 5' }, project: { type: 'string', description: '可选，限定项目' } }, required: ['query'] }
   },
   {
     name: 'mt_checkpoint', description: '里程碑复盘：冻结当前主线 state 导出复盘文档，设为新基线，清空本阶段支线引用与最近对话日志',
@@ -61,7 +69,9 @@ function callTool(name, args) {
     case 'mt_set_project': { const p = mt.setActiveProject(args.project); return `已激活项目：${p}`; }
     case 'mt_route': { const r = mt.route(args.message, args.project); return JSON.stringify(r, null, 2); }
     case 'mt_branch': { const b = mt.openBranch(args.project || mt.config.activeProject || mt.config.defaultProject, args.title); return `已开新支线：\n${JSON.stringify(b, null, 2)}`; }
-    case 'mt_merge': { const p = args.project || mt.config.activeProject || mt.config.defaultProject; const r = mt.mergeBranch(p, args.branchId, args.summary); return JSON.stringify(r, null, 2); }
+    case 'mt_merge': { const p = args.project || mt.config.activeProject || mt.config.defaultProject; const r = mt.mergeBranch(p, args.branchId, args.summary, !!args.force); return JSON.stringify(r, null, 2); }
+    case 'mt_merge_resolve': { const p = args.project || mt.config.activeProject || mt.config.defaultProject; const r = mt.resolveMerge(p, args.branchId, args.resolutions, args.summary || null); return JSON.stringify(r, null, 2); }
+    case 'mt_search': { const r = mt.semanticSearch(args.query, args.topK || 5, args.project); return JSON.stringify(r, null, 2); }
     case 'mt_checkpoint': { const p = args.project || mt.config.activeProject || mt.config.defaultProject; const r = mt.checkpoint(p, args.title, args.review); return JSON.stringify(r, null, 2); }
     case 'mt_get_context': { const p = args.project || mt.config.activeProject || mt.config.defaultProject; return mt.getContext(p, args.maxRecent || 6); }
     case 'mt_chat': { const p = args.project || mt.config.activeProject || mt.config.defaultProject; mt.recordChat(p, args.role || 'user', args.message); return '已记入闲聊分区（激进压缩）'; }
@@ -83,7 +93,9 @@ function HELP_TEXT() {
     '- mt_route(message) → 意图分类 + 隔离路由 + 返回主线上下文（每次用户发言先调用）',
     '- mt_set_project(name) → 切换激活项目',
     '- mt_branch(title) → 新开支线，返回 branchId',
-    '- mt_merge(branchId, [summary]) → 支线合并入主线并归档',
+    '- mt_merge(branchId, [summary], [force]) → 支线合并入主线并归档（冲突需确认：返回 needsConfirmation 后用 mt_merge_resolve 提交）',
+    '- mt_merge_resolve(branchId, resolutions, [summary]) → 提交用户对合并冲突的决议',
+    '- mt_search(query, [topK], [project]) → 语义检索全部记忆（找"忘了在哪棵子树"的内容）',
     '- mt_checkpoint(title, [review]) → 里程碑复盘，冻结为新基线',
     '- mt_get_context([maxRecent]) → 取主线上下文注入对话',
     '- mt_chat(message) → 闲聊写入隔离分区（激进压缩）',
@@ -93,7 +105,9 @@ function HELP_TEXT() {
     '1) 用户发言 → mt_route → 拿到主线上下文作为系统背景',
     '2) 深入某话题 → mt_branch("名词调研") → 在支线里折腾',
     '3) 得出结论 → mt_merge(branchId, "结构化结论...")',
+    '   - 若返回 needsConfirmation：逐条展示 conflicts 给用户，征询 keepBoth/replace/drop，再 mt_merge_resolve(branchId, resolutions)',
     '4) 阶段结束 → mt_checkpoint("阶段1复盘")',
+    '5) 想找历史记忆但忘了落在哪 → mt_search("关键词")',
   ].join('\n');
 }
 
@@ -111,7 +125,7 @@ function handle(msg) {
     send({ jsonrpc: '2.0', id, result: {
       protocolVersion: '2024-11-05',
       capabilities: { tools: {} },
-      serverInfo: { name: 'dsh-memory-tree', version: '1.0.0' }
+      serverInfo: { name: 'dsh-memory-tree', version: '1.1.0' }
     } });
     return;
   }
