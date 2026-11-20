@@ -1,145 +1,153 @@
-// dsh-memory-tree — MCP server (stdio, LSP 帧格式, 纯 Node 标准库零依赖)
-// 让 DSH（经 mcp-manager）获得：隔离路由 / 记忆树 / Merge / Checkpoint / 三套压缩策略
 import { MemoryTree } from './engine.js';
 import fs from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
 
-const ROOT = process.env.MEMORY_TREE_ROOT || path.join(os.homedir(), '.dsh', 'memory-tree');
-const LOG = path.join(ROOT, 'mcp-server.log');
-fs.mkdirSync(ROOT, { recursive: true });
-function log(...a) { try { fs.appendFileSync(LOG, `[${new Date().toISOString()}] ${a.join(' ')}\n`); } catch {} }
+const mt = new MemoryTree(process.env.MEMORY_TREE_ROOT || undefined);
+const { version: VERSION } = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+const SUPPORTED_VERSIONS = new Set(['2024-11-05', '2025-03-26', '2025-06-18', '2025-11-25']);
+const string = { type: 'string' };
+const project = { type: 'string', description: '显式项目名，使用 mt_set_project 初始化' };
+const entry = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    category: { enum: ['constraints', 'decisions', 'results', 'openQuestions'] },
+    text: { type: 'string', maxLength: 4000 },
+    source: { type: 'string', maxLength: 500 },
+    date: { type: 'string', format: 'date' },
+    verification: { enum: ['user-confirmed', 'tool-verified', 'unverified'] },
+  },
+  required: ['category', 'text', 'source', 'date', 'verification'],
+};
 
-const mt = new MemoryTree(ROOT);
+function tool(name, description, properties, required, run, readOnlyHint = false) {
+  return {
+    name, description, run,
+    inputSchema: { type: 'object', properties, required, additionalProperties: false },
+    annotations: { readOnlyHint },
+  };
+}
 
-const TOOLS = [
-  {
-    name: 'mt_help', description: '显示记忆树插件的所有命令与用法（中文）', inputSchema: { type: 'object', properties: {} }
-  },
-  {
-    name: 'mt_status', description: '查看当前项目、主线状态、活跃支线、路由词配置', inputSchema: { type: 'object', properties: {} }
-  },
-  {
-    name: 'mt_set_project', description: '设置当前激活项目（记忆树根节点）。后续路由/主线操作默认作用于它',
-    inputSchema: { type: 'object', properties: { project: { type: 'string', description: '项目名，如 my-app' } }, required: ['project'] }
-  },
-  {
-    name: 'mt_route', description: '对用户消息做意图分类与隔离路由：命中闲聊→闲聊分区；命中项目关键词→绑定项目根节点并返回主线上下文。每次用户发言应先调用它',
-    inputSchema: { type: 'object', properties: { message: { type: 'string', description: '用户消息原文' }, project: { type: 'string', description: '可选，强制绑定到某项目' } }, required: ['message'] }
-  },
-  {
-    name: 'mt_branch', description: '为一次临时追问/试错新开一条支线（独立上下文，不污染主线）。返回 branchId',
-    inputSchema: { type: 'object', properties: { title: { type: 'string', description: '支线标题，如 名词调研' }, project: { type: 'string' } } }
-  },
-  {
-    name: 'mt_merge', description: '把支线合并入主线：提炼结构化结论追加到主线 state（只存结论，不复制原始聊天），并归档该支线。若支线结论与主线同类别已有项语义高度相似（疑似冲突），会返回 needsConfirmation 而不改动主线，需用户确认后用 mt_merge_resolve 提交决议。summary 可省略',
-    inputSchema: { type: 'object', properties: { branchId: { type: 'string' }, project: { type: 'string' }, summary: { type: 'string', description: '可选：由 LLM 预提炼的结构化结论 markdown' }, force: { type: 'boolean', description: '可选：true 跳过冲突确认直接合并（不安全，仅非交互场景用）' } }, required: ['branchId'] }
-  },
-  {
-    name: 'mt_merge_resolve', description: '在 mt_merge 返回 needsConfirmation 后，提交用户对冲突项的决议。resolutions 为数组，每项 { index, action: keepBoth|replace|drop, customText? }，index 对应 mt_merge 返回的 conflicts[].index。summary 若曾在 mt_merge 传入，此处需传相同值以保证冲突索引一致',
-    inputSchema: { type: 'object', properties: { branchId: { type: 'string' }, project: { type: 'string' }, resolutions: { type: 'array', description: '[{index,action,customText?}]' }, summary: { type: 'string' } }, required: ['branchId', 'resolutions'] }
-  },
-  {
-    name: 'mt_search', description: '语义检索记忆：在主线结构化条目、各支线结论、各 Checkpoint 复盘中做轻量本地向量检索（中文 bi-gram + 英文词 token + 余弦），返回最相关片段及出处与相似度。当不确定记忆落在哪棵子树、或想跨项目找相关内容时使用。project 可省略（搜全部项目）',
-    inputSchema: { type: 'object', properties: { query: { type: 'string', description: '检索语句，如 鉴权方案' }, topK: { type: 'number', description: '返回条数，默认 5' }, project: { type: 'string', description: '可选，限定项目' } }, required: ['query'] }
-  },
-  {
-    name: 'mt_checkpoint', description: '里程碑复盘：冻结当前主线 state 导出复盘文档，设为新基线，清空本阶段支线引用与最近对话日志',
-    inputSchema: { type: 'object', properties: { title: { type: 'string', description: '如 阶段1复盘' }, review: { type: 'string', description: '可选复盘正文' }, project: { type: 'string' } } }
-  },
-  {
-    name: 'mt_get_context', description: '获取主线上下文（结构化 state + 最近少量主线对话），用于注入对话。支线原始日志默认不注入',
-    inputSchema: { type: 'object', properties: { project: { type: 'string' }, maxRecent: { type: 'number', description: '最近主线对话条数，默认 6' } } }
-  },
-  {
-    name: 'mt_chat', description: '记录一条闲聊消息到闲聊分区（激进压缩，细节可丢，不写入项目主线）',
-    inputSchema: { type: 'object', properties: { message: { type: 'string' }, role: { type: 'string', description: 'user|assistant', default: 'user' }, project: { type: 'string' } }, required: ['message'] }
-  },
-  {
-    name: 'mt_list_branches', description: '列出当前项目的支线（含活跃/已归档）',
-    inputSchema: { type: 'object', properties: { project: { type: 'string' } } }
-  }
+const tools = [
+  tool('mt_help', '显示记忆树使用说明', {}, [], () => ({
+    workflow: '初始化项目 → 建立记忆支线 → 提交结构化结论 → 创建阶段快照',
+    scope: '读写显式传 project。跨项目搜索需显式设置 scope: all。',
+    reliability: '检索结果是参考材料。阅读来源、验证状态和历史状态再使用。',
+  }), true),
+  tool('mt_status', '查看项目列表或指定项目的主线和支线状态', { project }, [],
+    args => mt.status(args.project), true),
+  tool('mt_set_project', '显式初始化项目，返回规范项目名', { project }, ['project'],
+    args => ({ project: mt.setActiveProject(args.project) })),
+  tool('mt_route', '返回关键词路由建议。显式传 project 时可返回该项目主线', { message: string, project }, ['message'],
+    args => mt.route(args.message, args.project), true),
+  tool('mt_branch', '为项目创建一条记忆支线', { project, title: string }, ['project'],
+    args => mt.openBranch(args.project, args.title)),
+  tool('mt_merge', '提交结构化结论。entries 优先，旧 summary 作为待验证材料导入。冲突时先返回待确认决议',
+    { project, branchId: string, entries: { type: 'array', items: entry, minItems: 1, maxItems: 50 }, summary: string },
+    ['project', 'branchId'], args => mt.mergeBranch(args.project, args.branchId, args)),
+  tool('mt_merge_resolve', '使用预览 token 提交完整冲突决议',
+    {
+      project, branchId: string, token: string,
+      resolutions: {
+        type: 'array',
+        items: {
+          type: 'object', additionalProperties: false,
+          properties: { index: { type: 'integer', minimum: 0 }, action: { enum: ['keepBoth', 'replace', 'drop'] } },
+          required: ['index', 'action'],
+        },
+      },
+    }, ['project', 'branchId', 'token', 'resolutions'],
+    args => mt.resolveMerge(args.project, args.branchId, args.token, args.resolutions)),
+  tool('mt_search', '本地词法检索。默认查当前条目。历史记录按需包含，跨项目需显式选择',
+    { query: string, project, scope: { enum: ['all'] }, includeHistorical: { type: 'boolean' },
+      topK: { type: 'integer', minimum: 1, maximum: 50 } },
+    ['query'], args => mt.search(args.query, args), true),
+  tool('mt_checkpoint', '冻结项目状态为阶段快照，保留历史和会话',
+    { project, title: string, review: string }, ['project'], args => mt.checkpoint(args.project, args.title, args.review)),
+  tool('mt_get_checkpoint', '按 ID 读取阶段快照 Markdown', { project, id: string }, ['project', 'id'],
+    args => mt.getCheckpoint(args.project, args.id), true),
+  tool('mt_get_context', '读取有长度上限的项目主线上下文',
+    { project, maxRecent: { type: 'integer', minimum: 0, maximum: 40 } }, ['project'],
+    args => mt.getContext(args.project, args.maxRecent), true),
+  tool('mt_chat', '显式保存一条闲聊到指定项目的独立记录，保留近期条目',
+    { project, message: string, role: { enum: ['user', 'assistant'] } }, ['project', 'message'],
+    args => mt.recordChat(args.project, args.role ?? 'user', args.message)),
+  tool('mt_list_branches', '列出项目的活跃和已归档支线', { project }, ['project'],
+    args => mt.listBranches(args.project), true),
 ];
 
-function callTool(name, args) {
-  args = args || {};
-  switch (name) {
-    case 'mt_help': return HELP_TEXT();
-    case 'mt_status': return JSON.stringify(mt.status(), null, 2);
-    case 'mt_set_project': { const p = mt.setActiveProject(args.project); return `已激活项目：${p}`; }
-    case 'mt_route': { const r = mt.route(args.message, args.project); return JSON.stringify(r, null, 2); }
-    case 'mt_branch': { const b = mt.openBranch(args.project || mt.config.activeProject || mt.config.defaultProject, args.title); return `已开新支线：\n${JSON.stringify(b, null, 2)}`; }
-    case 'mt_merge': { const p = args.project || mt.config.activeProject || mt.config.defaultProject; const r = mt.mergeBranch(p, args.branchId, args.summary, !!args.force); return JSON.stringify(r, null, 2); }
-    case 'mt_merge_resolve': { const p = args.project || mt.config.activeProject || mt.config.defaultProject; const r = mt.resolveMerge(p, args.branchId, args.resolutions, args.summary || null); return JSON.stringify(r, null, 2); }
-    case 'mt_search': { const r = mt.semanticSearch(args.query, args.topK || 5, args.project); return JSON.stringify(r, null, 2); }
-    case 'mt_checkpoint': { const p = args.project || mt.config.activeProject || mt.config.defaultProject; const r = mt.checkpoint(p, args.title, args.review); return JSON.stringify(r, null, 2); }
-    case 'mt_get_context': { const p = args.project || mt.config.activeProject || mt.config.defaultProject; return mt.getContext(p, args.maxRecent || 6); }
-    case 'mt_chat': { const p = args.project || mt.config.activeProject || mt.config.defaultProject; mt.recordChat(p, args.role || 'user', args.message); return '已记入闲聊分区（激进压缩）'; }
-    case 'mt_list_branches': { const p = args.project || mt.config.activeProject || mt.config.defaultProject; return JSON.stringify(mt.listBranches(p), null, 2); }
-    default: return `未知工具：${name}`;
+const TOOLS = tools.map(({ run, ...definition }) => definition);
+const handlers = new Map(tools.map(definition => [definition.name, definition]));
+
+function validate(schema, value, field) {
+  if (schema.enum && !schema.enum.includes(value)) throw new Error(`${field} 的值不受支持`);
+  if (schema.type === 'string' && (typeof value !== 'string' || value.length > (schema.maxLength ?? 32000))) {
+    throw new Error(`${field} 需要长度有效的字符串`);
+  }
+  if (schema.type === 'integer' && (!Number.isInteger(value) || value < (schema.minimum ?? 0) ||
+      value > (schema.maximum ?? Number.MAX_SAFE_INTEGER))) throw new Error(`${field} 超出整数范围`);
+  if (schema.type === 'boolean' && typeof value !== 'boolean') throw new Error(`${field} 需要布尔值`);
+  if (schema.type === 'array') {
+    if (!Array.isArray(value) || value.length < (schema.minItems ?? 0) || value.length > (schema.maxItems ?? 50)) {
+      throw new Error(`${field} 需要长度有效的数组`);
+    }
+    value.forEach((item, index) => validate(schema.items, item, `${field}[${index}]`));
+  }
+  if (schema.type === 'object') {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${field} 需要对象`);
+    for (const required of schema.required) {
+      if (!Object.hasOwn(value, required)) throw new Error(`缺少 ${required}`);
+    }
+    for (const [key, item] of Object.entries(value)) {
+      if (!Object.hasOwn(schema.properties, key)) throw new Error(`未知参数：${key}`);
+      validate(schema.properties[key], item, key);
+    }
   }
 }
 
-function HELP_TEXT() {
-  return [
-    '# DSH 记忆树插件 命令手册',
-    '',
-    '## 记忆模型',
-    '- Root Node（项目主线）：结构化 state（约束/决策/成果/待解），持久化到 ~/.dsh/memory-tree/<项目>/',
-    '- Branch Node（支线）：每次临时追问/试错自动新开，独立上下文；原始日志默认不注入主线',
-    '- Checkpoint（里程碑）：冻结主线为复盘文档，作为新基线',
-    '',
-    '## 工具',
-    '- mt_route(message) → 意图分类 + 隔离路由 + 返回主线上下文（每次用户发言先调用）',
-    '- mt_set_project(name) → 切换激活项目',
-    '- mt_branch(title) → 新开支线，返回 branchId',
-    '- mt_merge(branchId, [summary], [force]) → 支线合并入主线并归档（冲突需确认：返回 needsConfirmation 后用 mt_merge_resolve 提交）',
-    '- mt_merge_resolve(branchId, resolutions, [summary]) → 提交用户对合并冲突的决议',
-    '- mt_search(query, [topK], [project]) → 语义检索全部记忆（找"忘了在哪棵子树"的内容）',
-    '- mt_checkpoint(title, [review]) → 里程碑复盘，冻结为新基线',
-    '- mt_get_context([maxRecent]) → 取主线上下文注入对话',
-    '- mt_chat(message) → 闲聊写入隔离分区（激进压缩）',
-    '- mt_list_branches() / mt_status() / mt_help()',
-    '',
-    '## 典型工作流',
-    '1) 用户发言 → mt_route → 拿到主线上下文作为系统背景',
-    '2) 深入某话题 → mt_branch("名词调研") → 在支线里折腾',
-    '3) 得出结论 → mt_merge(branchId, "结构化结论...")',
-    '   - 若返回 needsConfirmation：逐条展示 conflicts 给用户，征询 keepBoth/replace/drop，再 mt_merge_resolve(branchId, resolutions)',
-    '4) 阶段结束 → mt_checkpoint("阶段1复盘")',
-    '5) 想找历史记忆但忘了落在哪 → mt_search("关键词")',
-  ].join('\n');
+function callTool(name, args) {
+  const handler = handlers.get(name);
+  if (!handler) throw new Error(`未知工具：${name}`);
+  validate(handler.inputSchema, args, 'arguments');
+  return handler.run(args);
 }
 
 // ---------- JSON-RPC / MCP 帧处理 ----------
 let buf = Buffer.alloc(0);
+let framing = null;
+const MAX_MESSAGE_BYTES = 4 * 1024 * 1024;
 function send(obj) {
   const s = JSON.stringify(obj);
   const payload = Buffer.from(s, 'utf8');
   const header = Buffer.from(`Content-Length: ${payload.length}\r\n\r\n`, 'utf8');
-  process.stdout.write(Buffer.concat([header, payload]));
+  process.stdout.write(framing === 'legacy' ? Buffer.concat([header, payload]) : s + '\n');
 }
 function handle(msg) {
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg) ||
+      msg.jsonrpc !== '2.0' || typeof msg.method !== 'string') {
+    send({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request' } });
+    return;
+  }
   const id = msg.id;
+  if (id === undefined) return;
   if (msg.method === 'initialize') {
     send({ jsonrpc: '2.0', id, result: {
-      protocolVersion: '2024-11-05',
+      protocolVersion: SUPPORTED_VERSIONS.has(msg.params?.protocolVersion) ? msg.params.protocolVersion : '2024-11-05',
       capabilities: { tools: {} },
-      serverInfo: { name: 'dsh-memory-tree', version: '1.1.0' }
+      serverInfo: { name: 'dsh-memory-tree', version: VERSION }
     } });
     return;
   }
-  if (msg.method === 'notifications/initialized' || msg.method === 'ping') return;
+  if (msg.method === 'ping') { if (id !== undefined) send({ jsonrpc: '2.0', id, result: {} }); return; }
   if (msg.method === 'tools/list') {
     send({ jsonrpc: '2.0', id, result: { tools: TOOLS } });
     return;
   }
   if (msg.method === 'tools/call') {
     const name = msg.params?.name;
-    const args = msg.params?.arguments || {};
+    const args = msg.params?.arguments ?? {};
     try {
-      const text = callTool(name, args);
-      send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: String(text) }] } });
+      const result = callTool(name, args);
+      send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(result) }] } });
     } catch (e) {
       send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: `错误：${e.message}` }], isError: true } });
     }
@@ -150,20 +158,40 @@ function handle(msg) {
 }
 process.stdin.on('data', (chunk) => {
   buf = Buffer.concat([buf, chunk]);
-  while (true) {
-    const sep = buf.indexOf('\r\n\r\n');
-    if (sep === -1) break;
-    const headerStr = buf.slice(0, sep).toString('utf8');
-    const m = headerStr.match(/Content-Length:\s*(\d+)/i);
-    if (!m) { buf = buf.slice(sep + 4); continue; }
-    const len = parseInt(m[1], 10);
-    const start = sep + 4;
-    if (buf.length < start + len) break; // 帧不完整
-    const body = buf.slice(start, start + len).toString('utf8');
-    buf = buf.slice(start + len);
-    try { const msg = JSON.parse(body); log('recv', msg.method || (msg.id ? 'resp' : '?')); handle(msg); }
-    catch (e) { log('parse err', e.message); }
+  if (buf.length > MAX_MESSAGE_BYTES) { process.stderr.write('MCP message too large\n'); process.exit(1); }
+  while (buf.length) {
+    if (!framing) {
+      const first = buf.toString('utf8').trimStart();
+      if (!first) return;
+      const prefix = first.toLowerCase();
+      if ('content-length:'.startsWith(prefix)) return;
+      framing = prefix.startsWith('content-length:') ? 'legacy' : 'jsonl';
+    }
+    let body;
+    if (framing === 'jsonl') {
+      const end = buf.indexOf('\n');
+      if (end < 0) return;
+      body = buf.subarray(0, end).toString('utf8').trim();
+      buf = buf.subarray(end + 1);
+      if (!body) continue;
+    } else {
+      const sep = buf.indexOf('\r\n\r\n');
+      if (sep < 0) return;
+      const match = buf.subarray(0, sep).toString('utf8').match(/Content-Length:\s*(\d+)/i);
+      if (!match || Number(match[1]) > MAX_MESSAGE_BYTES) { process.stderr.write('Invalid MCP frame\n'); process.exit(1); }
+      const start = sep + 4, length = Number(match[1]);
+      if (buf.length < start + length) return;
+      body = buf.subarray(start, start + length).toString('utf8');
+      buf = buf.subarray(start + length);
+    }
+    let message;
+    try {
+      message = JSON.parse(body);
+    } catch {
+      send({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
+      continue;
+    }
+    handle(message);
   }
 });
 process.stdin.on('end', () => process.exit(0));
-log('dsh-memory-tree MCP server started, root=', ROOT);

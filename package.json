@@ -1,7 +1,7 @@
 {
   "name": "dsh-memory-tree",
-  "version": "1.1.0",
-  "description": "DSH (DeepSeek Harness) 记忆树插件：隔离路由 + 主线/支线记忆树 + Merge + Checkpoint + 三套上下文压缩策略。以零依赖 MCP server 形式运行。",
+  "version": "2.0.0",
+  "description": "DSH 项目记忆树：结构化主线、支线合并与阶段快照。本地存储，零运行时依赖。",
   "keywords": [
     "deepseek",
     "deepseek-harness",
@@ -24,9 +24,10 @@
   "type": "module",
   "packageManager": "pnpm@11.7.0",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18.0.0",
+    "dsh": "0.2.2-rc.3"
   },
-  "main": "src/server.js",
+  "main": "src/plugin.js",
   "files": [
     "src",
     "cordis.patch.yml",
@@ -37,21 +38,11 @@
   ],
   "scripts": {
     "start": "node src/server.js",
-    "test": "node test/smoke.mjs"
+    "test": "python -B test/verify.py"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
-    },
-    "compatibility": {
-      "dsh": ">=0.1.0-rc.8 <0.2.0 || 0.2.0-rc.2 || 0.2.1-rc.2 || 0.2.1-rc.3 || 0.2.1-rc.5 || 0.2.2-rc.1 || 0.2.2-rc.2",
-      "dshReleases": {
-        "0.2.2-rc.2": "compatible"
-      },
-      "profiles": [
-        "web",
-        "headless"
-      ]
     }
   },
   "dependencies": {},

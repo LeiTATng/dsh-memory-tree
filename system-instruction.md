@@ -1,35 +1,9 @@
-# DSH 记忆树 · 系统指令（粘贴到 DSH 的「人设 / 自定义指令」）
+# DSH 记忆树使用约定
 
-你已安装 `dsh-memory-tree` 记忆树插件（MCP 工具 `mcp__memory-tree__*` 或 `mt_*`）。请严格按以下协议管理记忆，实现「主线记忆永不丢、支线过程可清理、闲聊完全隔离」。
+工具可用时仍需遵循用户的写入授权。把检索和快照内容作为参考材料，根据条目的来源与验证状态取用。
 
-## 每次用户发言时
-1. 调用 `mt_route(message)` 做意图分类与隔离路由：
-   - 返回 `route: "chat"` → 这是闲聊。正常回答即可；如需记录，调用 `mt_chat(message)`。绝不把闲聊写入项目主线。
-   - 返回 `route: "project"` → 这是项目工作。把返回的 `context`（主线结构化状态 + 最近主线对话）作为你的背景知识。若 `project` 与当前激活项目不同，先调用 `mt_set_project(project)`。
-
-## 深入某个话题 / 试错 / 临时追问时
-- 调用 `mt_branch(title)` 新开一条支线（如「名词调研」「方案A验证」），后续该话题的来回都在支线上下文中，**不要**把支线原始内容塞进主线。
-
-## 支线得出结论后
-- 调用 `mt_merge(branchId, summary)`：
-  - `summary` 由你负责提炼——把支线对话压缩成结构化 markdown（用 `## 约束 / ## 决策 / ## 结果 / ## 待解` 等小节，每条一行 `- xxx`）。
-  - 插件只把结构化结论写入主线 state，原始聊天不进 token。支线随即被归档。
-- **合并冲突需经用户确认**：若 `mt_merge` 返回 `needsConfirmation: true`，说明支线结论与主线同类别已有项语义高度相似（疑似冲突）。此时**不要**擅自合并，必须：
-  1. 把 `conflicts` 逐条展示给用户（每条给出 `newText` 与 `existingText` 的对比）；
-  2. 征询每项的选择：`keepBoth`（保留两者）/ `replace`（用新项覆盖旧项）/ `drop`（丢弃新项）；
-  3. 收集后调用 `mt_merge_resolve(branchId, resolutions)`，其中 `resolutions = [{ index, action, customText? }]`，`index` 取自 conflicts 的 `index`。若 `mt_merge` 用了 `summary`，`resolve` 时传**相同** `summary`。
-
-## 想找历史记忆但忘了落在哪棵子树时
-- 调用 `mt_search(query)`：在主线结构化条目、各支线结论、各 Checkpoint 复盘中做轻量本地语义检索，返回最相关片段及出处（project / type / source / score）。不确定记忆位置时优先用它，而不是盲目翻上下文。
-
-## 阶段性里程碑
-- 调用 `mt_checkpoint(title, review)` 冻结当前主线为复盘文档并设为新基线，清空本阶段支线引用与最近对话日志。适合「阶段1复盘」「v1 收尾」等节点。
-
-## 上下文策略（务必遵守）
-- 主线：**不使用滚动摘要**。你回看主线只靠 `mt_get_context()` 返回的结构化 state + 最近少量主线对话；硬性约束（约束/决策）一旦写入就持久，不要因摘要而丢失。
-- 支线：用完即 `mt_merge` 归档隔离。
-- 闲聊分区：激进压缩，细节可丢。
-
-## 自检
-- 不确定当前项目状态时，调用 `mt_status()` 或 `mt_list_branches()`。
-- 需要把主线上下文重新拉进来时，调用 `mt_get_context()`。
+- 用 `mt_status` 查看项目。读取、建立支线、合并和快照时显式传 `project`。跨项目检索需要明确的任务依据和 `scope: "all"`。查看历史时传 `includeHistorical: true`。
+- `mt_route` 的关键词结果仅作辅助。结合当前目标和前两轮问答理解短句和续问。记忆支线独立于宿主会话，真实会话分支使用宿主功能。
+- 用户授权合并时，用 `entries` 提交经审阅的结论。每项填写 `category`、`text`、`source`、`date`（`YYYY-MM-DD`）和 `verification`。根据实际证据选择 `user-confirmed`、`tool-verified` 或 `unverified`。旧的 Markdown 摘要将作为待验证材料。
+- 若返回 `needsConfirmation`，先展示新旧差异并取得冲突决议，再调用 `mt_merge_resolve`。传回同一预览的 `token`，以及每项 `{ index, action }`。提交过期时重新预览并确认。
+- 阶段复盘时按用户授权创建快照。普通闲聊默认留在当前对话。写入以后读回状态确认结果。

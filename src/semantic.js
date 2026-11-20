@@ -49,7 +49,7 @@ export function cosine(a, b) {
   return dot / (Math.sqrt(na) * Math.sqrt(nb));
 }
 
-// 倒排/向量索引：doc = { id, project, type, source, text, vec }
+// 小型语料的内存词频索引。
 export class SemanticIndex {
   constructor() { this.docs = []; }
   add(id, project, type, source, text) {

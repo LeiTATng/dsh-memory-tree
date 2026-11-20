@@ -1,384 +1,442 @@
-// dsh-memory-tree — 记忆树引擎（纯 Node 标准库，零依赖）
-// 实现：隔离路由 / 记忆树（Root+Branch）/ Merge / Checkpoint / 三套上下文压缩策略
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import crypto from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { tokenize, tf, cosine, SemanticIndex } from './semantic.js';
+import { commit, list, publish, readJson, revisions } from './store.js';
 
-const MERGE_CONFLICT_THRESHOLD = 0.5; // 支线新项与主线同类别已存在项的余弦相似度 >= 此值且非精确重复 → 判为冲突，需用户确认
+const CATEGORIES = {
+  constraints: '约束', decisions: '决策', results: '成果', openQuestions: '待解问题',
+};
+const KEYS = Object.keys(CATEGORIES);
+const DEFAULT_IDLE = ['你好', '您好', 'hi', 'hello', '在吗', '谢谢', '感谢', '哈哈', '好的', '晚安', '天气', '再见'];
+const DEFAULT_PROJECT = ['项目', '代码', 'bug', '修复', '实现', '开发', '调研', '分析', '设计', '接口', '部署',
+  '测试', '优化', '重构', '需求', '方案', '文档', '报错', '配置', 'git'];
+const HEADINGS = new Map([
+  ['约束', 'constraints'], ['核心约束', 'constraints'], ['constraints', 'constraints'],
+  ['决策', 'decisions'], ['关键决策', 'decisions'], ['decisions', 'decisions'],
+  ['结果', 'results'], ['成果', 'results'], ['results', 'results'],
+  ['待验证', 'openQuestions'], ['未验证结果', 'openQuestions'], ['待解', 'openQuestions'],
+  ['待解问题', 'openQuestions'], ['问题', 'openQuestions'], ['open questions', 'openQuestions'],
+]);
+const VERIFY = ['user-confirmed', 'tool-verified', 'unverified'];
+const MAX_TEXT = 4000;
 
-const DEFAULT_IDLE = ['你好', '您好', 'hi', 'hello', '在吗', '在不在', '谢谢', '感谢', '哈哈',
-  '哦哦', '好的', '了解', '辛苦了', '早上好', '晚安', '今天', '天气', '吃饭', '早', '晚安咯',
-  '谢谢哈', '多谢', '拜拜', '再见', '嗯嗯', '啊这', '笑死', '666', '牛', '赞'];
-const DEFAULT_PROJECT = ['项目', '代码', 'bug', '修复', '实现', '开发', '调研', '分析', '设计',
-  '架构', '接口', '函数', '类', '模块', '部署', '测试', '优化', '重构', '需求', '方案', '文档',
-  '报错', '异常', '日志', '服务端', '前端', '后端', '数据库', 'api', '算法', '性能', '样式',
-  '组件', '路由', '状态', '配置', '脚本', '命令行', 'cli', 'git', '编译', '构建', '依赖'];
+function digest(value) {
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
 
-function nowISO() { return new Date().toISOString(); }
-function rid(prefix) { return prefix + '-' + crypto.randomBytes(4).toString('hex'); }
+function text(value, field, limit = MAX_TEXT) {
+  if (typeof value !== 'string' || !value.trim() || value.length > limit) {
+    throw new Error(`${field} 需要 1–${limit} 个字符`);
+  }
+  return value.trim();
+}
+
+function readText(file) {
+  try {
+    return fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    if (error.code === 'ENOENT') return '';
+    throw error;
+  }
+}
+
+function ensureDirectory(dir) {
+  const entry = fs.lstatSync(dir, { throwIfNoEntry: false });
+  if (entry && !entry.isDirectory()) throw new Error(`记忆目录类型无效：${path.basename(dir)}`);
+}
+
+function markdownLines(markdown) {
+  return markdown.split(/\r?\n/).map(line => line.trim().replace(/^[-*]\s+/, ''))
+    .filter(line => line && !/^([#>]|-{3,}$)/.test(line));
+}
 
 export class MemoryTree {
-  constructor(root) {
-    this.root = root || path.join(os.homedir(), '.dsh', 'memory-tree');
-    fs.mkdirSync(this.root, { recursive: true });
-    this.configPath = path.join(this.root, '_config.json');
-    this.config = this.loadConfig();
-  }
-
-  // ---------- 配置 ----------
-  loadConfig() {
-    if (fs.existsSync(this.configPath)) {
-      try { return JSON.parse(fs.readFileSync(this.configPath, 'utf8')); } catch {}
-    }
-    return {
-      activeProject: null,
-      defaultProject: 'default',
-      projects: {},
-      routing: { idleWords: DEFAULT_IDLE.slice(), projectWords: DEFAULT_PROJECT.slice() }
+  constructor(root = path.join(os.homedir(), '.dsh', 'memory-tree')) {
+    this.root = path.resolve(root);
+    this.config = readJson(path.join(this.root, '_config.json'), {});
+    this.activeProject = this.config.activeProject || null;
+    this.routing = {
+      idleWords: this.config.routing?.idleWords ?? DEFAULT_IDLE,
+      projectWords: this.config.routing?.projectWords ?? DEFAULT_PROJECT,
     };
   }
-  saveConfig() { fs.writeFileSync(this.configPath, JSON.stringify(this.config, null, 2)); }
 
-  // ---------- 路径 ----------
-  projDir(name) { const d = path.join(this.root, name); fs.mkdirSync(d, { recursive: true }); return d; }
-  mainlineStatePath(name) { return path.join(this.projDir(name), 'mainline.state.json'); }
-  mainlineMdPath(name) { return path.join(this.projDir(name), 'mainline.md'); }
-  mainlineEventsPath(name) { return path.join(this.projDir(name), 'mainline.events.jsonl'); }
-  branchesDir(name) { const d = path.join(this.projDir(name), 'branches'); fs.mkdirSync(d, { recursive: true }); return d; }
-  branchDir(name, id) { const d = path.join(this.branchesDir(name), id); fs.mkdirSync(d, { recursive: true }); return d; }
-  checkpointsDir(name) { const d = path.join(this.projDir(name), 'checkpoints'); fs.mkdirSync(d, { recursive: true }); return d; }
-  chatPath(name) { return path.join(this.projDir(name || this.config.defaultProject), 'chat', 'chat.events.jsonl'); }
-
-  // ---------- 项目/主线 ----------
-  ensureProject(name) {
-    if (!this.config.projects[name]) this.config.projects[name] = { created: nowISO(), root: name };
-    this.saveConfig();
-    if (!fs.existsSync(this.mainlineStatePath(name))) {
-      const init = { constraints: [], decisions: [], results: [], openQuestions: [],
-        updated: nowISO(), baselineCheckpoint: null };
-      fs.writeFileSync(this.mainlineStatePath(name), JSON.stringify(init, null, 2));
+  projectKey(name) {
+    if (typeof name !== 'string' || !name.trim() || name !== name.trim() || name.length > 100 ||
+        name.startsWith('.') || /[\\/:*?"<>|\x00-\x1f]|[.]$/.test(name) ||
+        /^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(name) ||
+        ['__proto__', 'constructor', 'prototype'].includes(name.toLowerCase())) {
+      throw new Error('无效项目名称');
     }
-    return name;
+    return name.normalize('NFC').toLowerCase().normalize('NFC');
   }
-  getMainline(name) {
-    this.ensureProject(name);
-    return JSON.parse(fs.readFileSync(this.mainlineStatePath(name), 'utf8'));
+
+  projectPath(name) {
+    const key = this.projectKey(name);
+    const matches = list(this.root).filter(entry => entry.name.normalize('NFC').toLowerCase().normalize('NFC') === key);
+    if (matches.length > 1) throw new Error('检测到名称冲突的旧项目目录，请先核对并迁移');
+    if (matches[0] && !matches[0].isDirectory()) throw new Error('项目路径必须是实际目录');
+    const project = matches[0]?.name ?? key;
+    return { name: project, dir: path.join(this.root, project) };
   }
-  saveMainline(name, state) {
-    state.updated = nowISO();
-    fs.writeFileSync(this.mainlineStatePath(name), JSON.stringify(state, null, 2));
-    fs.writeFileSync(this.mainlineMdPath(name), this.renderMainline(name, state));
-  }
-  renderMainline(name, state) {
-    const line = (a) => (a && a.length ? a.map((x, i) => `  ${i + 1}. ${x}`).join('\n') : '  (暂无)');
-    return `# 项目主线状态：${name}\n\n> 最后更新：${state.updated}\n> 基线 Checkpoint：${state.baselineCheckpoint || '（无）'}\n\n` +
-      `## 核心约束 (constraints)\n${line(state.constraints)}\n\n` +
-      `## 关键决策 (decisions)\n${line(state.decisions)}\n\n` +
-      `## 成果 (results)\n${line(state.results)}\n\n` +
-      `## 待解问题 (openQuestions)\n${line(state.openQuestions)}\n`;
-  }
-  // 主线追加（结构化，不接受原始聊天）
-  appendMainline(name, patch) {
-    const s = this.getMainline(name);
-    for (const k of ['constraints', 'decisions', 'results', 'openQuestions']) {
-      if (patch[k] && Array.isArray(patch[k])) {
-        for (const item of patch[k]) if (item && !s[k].includes(item)) s[k].push(item);
+
+  loadProject(name, required = true) {
+    const project = this.projectPath(name);
+    const revisionDir = path.join(project.dir, '.revisions');
+    ensureDirectory(revisionDir);
+    const legacy = readJson(path.join(project.dir, 'mainline.state.json'), null);
+    const branchDir = path.join(project.dir, 'branches');
+    ensureDirectory(branchDir);
+    const branches = new Map();
+    for (const entry of list(branchDir)) {
+      if (!entry.isDirectory()) continue;
+      const meta = readJson(path.join(branchDir, entry.name, 'meta.json'), null);
+      if (meta) branches.set(entry.name, { ...meta, id: entry.name, legacy: true });
+    }
+    const checkpoints = new Map();
+    const entries = new Map((legacy ? KEYS.flatMap(category => legacy[category].map((value, index) => ({
+      id: digest([project.name, category, index, value]), category, text: value,
+      verification: 'legacy', status: 'current',
+    }))) : []).map(entry => [entry.id, entry]));
+    let baseline = legacy?.baselineCheckpoint ?? null;
+    let updated = legacy?.updated ?? null;
+    let revision = 0;
+    const archivedEntries = [];
+    for (const filename of revisions(revisionDir)) {
+      const change = readJson(path.join(revisionDir, filename));
+      if (Number(filename.slice(0, -5)) !== ++revision || change?.version !== 1) {
+        throw new Error('项目修订记录不连续或版本不受支持');
       }
+      for (const id of change.removedIds ?? []) entries.delete(id);
+      for (const entry of change.addedEntries ?? []) entries.set(entry.id, entry);
+      if (change.archivedEntries) archivedEntries.push(...change.archivedEntries);
+      if (change.branch) branches.set(change.branch.id, change.branch);
+      if (change.checkpoint) {
+        checkpoints.set(change.checkpoint.id, change.checkpoint);
+        baseline = change.checkpoint.id;
+      }
+      updated = change.time;
     }
-    this.saveMainline(name, s);
-    return s;
-  }
-  // 主线事件日志（最近少量主线对话，用于 get_context 注入）
-  recordMainlineTurn(name, role, text) {
-    const p = this.mainlineEventsPath(name);
-    fs.appendFileSync(p, JSON.stringify({ t: nowISO(), role, text: String(text).slice(0, 4000) }) + '\n');
-    // 仅保留最近 40 条，避免无限增长（主线不靠滚动摘要，靠结构化 state + 最近少量）
-    this.trimLines(p, 40);
-  }
-  trimLines(p, keep) {
-    if (!fs.existsSync(p)) return;
-    const lines = fs.readFileSync(p, 'utf8').split('\n').filter(Boolean);
-    if (lines.length > keep) fs.writeFileSync(p, lines.slice(lines.length - keep).join('\n') + '\n');
+    const exists = !!(legacy || revision || branches.size);
+    if (!exists && required) throw new Error(`项目尚未初始化：${project.name}`);
+    return { ...project, exists, revisionDir, revision, entries: [...entries.values()], archivedEntries, branches, checkpoints, baseline, updated };
   }
 
-  // ---------- 隔离路由 ----------
-  classify(message) {
-    const msg = String(message || '').toLowerCase();
-    let score = 0;
-    for (const w of this.config.routing.idleWords) if (msg.includes(w.toLowerCase())) score -= 2;
-    for (const w of this.config.routing.projectWords) if (msg.toLowerCase().includes(w.toLowerCase())) score += 2;
-    if (/[`~]|\/|\.js|\.ts|\.py|\.go|\.java|\.md|function|def |class |import |http[s]?:\/\//.test(msg)) score += 1;
-    if (msg.length > 120) score += 1;
-    return score;
-  }
-  route(message, projectHint) {
-    const score = this.classify(message);
-    if (score <= 0) {
-      return { route: 'chat', project: null, score,
-        context: '（闲聊分区，不写入项目主线；激进压缩，细节可丢）' };
-    }
-    const project = projectHint || this.config.activeProject || this.config.defaultProject;
-    this.ensureProject(project);
-    const ctx = this.getContext(project, 6);
-    return { route: 'project', project, score, context: ctx };
-  }
-  setActiveProject(name) { this.config.activeProject = name; this.ensureProject(name); this.saveConfig(); return name; }
-
-  // ---------- 支线 ----------
-  openBranch(name, title, fromMainline = true) {
-    this.ensureProject(name);
-    const id = rid('branch');
-    const meta = { id, project: name, title: title || '(未命名支线)', parent: fromMainline ? 'mainline' : null,
-      created: nowISO(), status: 'active' };
-    fs.writeFileSync(path.join(this.branchDir(name, id), 'meta.json'), JSON.stringify(meta, null, 2));
-    fs.writeFileSync(path.join(this.branchDir(name, id), 'events.jsonl'), '');
-    return meta;
-  }
-  appendBranchEvent(name, id, role, text) {
-    const p = path.join(this.branchDir(name, id), 'events.jsonl');
-    fs.appendFileSync(p, JSON.stringify({ t: nowISO(), role, text: String(text).slice(0, 8000) }) + '\n');
-  }
-  getBranch(name, id) {
-    const meta = JSON.parse(fs.readFileSync(path.join(this.branchDir(name, id), 'meta.json'), 'utf8'));
-    const ev = fs.existsSync(path.join(this.branchDir(name, id), 'events.jsonl'))
-      ? fs.readFileSync(path.join(this.branchDir(name, id), 'events.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean)
-      : [];
-    return { meta, events: ev };
-  }
-  listBranches(name) {
-    const bd = this.branchesDir(name);
-    return fs.readdirSync(bd).filter(d => fs.existsSync(path.join(bd, d, 'meta.json')))
-      .map(d => { try { return JSON.parse(fs.readFileSync(path.join(bd, d, 'meta.json'), 'utf8')); } catch { return null; } })
-      .filter(Boolean);
-  }
-  archiveBranch(name, id) {
-    const meta = JSON.parse(fs.readFileSync(path.join(this.branchDir(name, id), 'meta.json'), 'utf8'));
-    meta.status = 'archived'; meta.archivedAt = nowISO();
-    fs.writeFileSync(path.join(this.branchDir(name, id), 'meta.json'), JSON.stringify(meta, null, 2));
-    return meta;
-  }
-
-  // ---------- Merge：支线 → 主线（只存结构化结论，不复制原始聊天）----------
-
-  // 支线新项与主线同类别已存在项的最佳匹配（余弦），用于冲突检测
-  bestMatch(arr, text) {
-    const qv = tf(tokenize(text));
-    let best = null;
-    arr.forEach((existing, i) => {
-      const s = cosine(qv, tf(tokenize(existing)));
-      if (!best || s > best.score) best = { index: i, text: existing, score: s };
+  save(project, change) {
+    return commit(project.revisionDir, project.revision, {
+      ...change, version: 1, time: new Date().toISOString(),
     });
-    return best;
   }
-  // 检测冲突：支线结论中，与主线同类别已存在项语义高度相似（非完全重复）的，标记为冲突
-  detectMergeConflicts(name, id, summary) {
-    const { meta, events } = this.getBranch(name, id);
-    const conclusion = summary || this.heuristicExtract(events);
-    const patch = this.parseStructured(conclusion);
-    const state = this.getMainline(name);
+
+  setActiveProject(name) {
+    const project = this.loadProject(name, false);
+    if (!project.exists) this.save(project, {});
+    // Kept as a local preference for status. Calls carrying project data
+    // always use an explicit project, even when DSH shares an MCP process.
+    this.activeProject = project.name;
+    return project.name;
+  }
+
+  getMainline(name) {
+    const project = this.loadProject(name);
+    return {
+      ...Object.fromEntries(KEYS.map(key => [key, project.entries.filter(item => item.category === key).map(item => item.text)])),
+      updated: project.updated,
+      baselineCheckpoint: project.baseline,
+    };
+  }
+
+  render(project) {
+    const sections = KEYS.map(key => {
+      const entries = project.entries.filter(entry => entry.category === key);
+      if (!entries.length) return `## ${CATEGORIES[key]}\n\n（暂无）`;
+      return `## ${CATEGORIES[key]}\n\n` + entries.map(entry => {
+        const metadata = [entry.date, entry.source, entry.verification].filter(Boolean).join(' · ');
+        return `- ${entry.text} [${entry.id}] (${metadata})`;
+      }).join('\n');
+    });
+    return [`# ${project.name}`, `基线：${project.baseline ?? '无'}`, ...sections].join('\n\n');
+  }
+
+  getContext(name, maxRecent = 6) {
+    if (!Number.isInteger(maxRecent) || maxRecent < 0 || maxRecent > 40) throw new Error('maxRecent 必须是 0–40 的整数');
+    const project = this.loadProject(name);
+    const recent = maxRecent ? readText(path.join(project.dir, 'mainline.events.jsonl')).trim().split('\n')
+      .filter(Boolean).slice(-maxRecent).map(line => {
+        const event = JSON.parse(line);
+        return `- [${event.role}] ${event.text.slice(0, 300)}`;
+      }).join('\n') : '';
+    const content = this.render(project) + (recent ? `\n\n## 最近主线记录\n${recent}` : '');
+    return {
+      project: project.name, revision: project.revision, truncated: content.length > 12000,
+      context: content.slice(0, 12000), trust: 'reference',
+    };
+  }
+
+  route(message, project) {
+    const msg = text(message, 'message', 16000).toLowerCase();
+    const score = this.routing.projectWords.filter(word => msg.includes(word.toLowerCase())).length * 2 -
+      this.routing.idleWords.filter(word => msg.includes(word.toLowerCase())).length * 2;
+    if (project !== undefined) return { route: 'project', score, advisory: true, ...this.getContext(project) };
+    return { route: score > 0 ? 'project' : 'undetermined', project: null, score, advisory: true };
+  }
+
+  openBranch(name, title = '未命名支线') {
+    const project = this.loadProject(name);
+    const branch = {
+      id: `branch-${randomUUID()}`, project: project.name, title: text(title, 'title', 200),
+      created: new Date().toISOString(), status: 'active',
+    };
+    this.save(project, { branch });
+    return branch;
+  }
+
+  branch(project, id) {
+    const branch = project.branches.get(id);
+    if (!branch) throw new Error('支线不存在');
+    return branch;
+  }
+
+  listBranches(name) {
+    return [...this.loadProject(name).branches.values()].map(({ pending, ...branch }) => branch);
+  }
+
+  parseSummary(summary) {
+    const items = [];
+    let category;
+    for (const line of text(summary, 'summary', 32000).split(/\r?\n/)) {
+      const heading = line.trim().match(/^##\s+(.+)$/);
+      if (heading) {
+        category = HEADINGS.get(heading[1].trim().toLowerCase());
+        if (!category) throw new Error(`无法识别的摘要标题：${heading[1]}`);
+      }
+      const item = line.trim().match(/^[-*]\s+(.+)$/);
+      if (item) {
+        if (!category) throw new Error('条目必须放在已知的二级标题下');
+        // Legacy Markdown cannot establish who verified a fact. Preserve it
+        // with explicit uncertainty; typed entries carry verified provenance.
+        items.push({ category, text: item[1], verification: 'unverified' });
+      }
+    }
+    return items;
+  }
+
+  proposedEntries(branch, summary, entries) {
+    if ((summary === undefined) === (entries === undefined)) throw new Error('请提供 summary 或 entries 中的一项');
+    const proposed = summary === undefined ? entries : this.parseSummary(summary);
+    if (!Array.isArray(proposed) || !proposed.length || proposed.length > 50) throw new Error('合并需要 1–50 条结构化结论');
+    return proposed.map(item => {
+      if (!item || !KEYS.includes(item.category) || !VERIFY.includes(item.verification)) throw new Error('结论类别或验证状态无效');
+      const date = item.date === undefined && summary !== undefined ? undefined : text(item.date, 'date', 10);
+      if (date && (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date)) ||
+          new Date(date).toISOString().slice(0, 10) !== date)) throw new Error('date 必须是有效的 YYYY-MM-DD 日期');
+      const source = summary !== undefined ? branch.id : text(item.source, 'source', 500);
+      return {
+        category: item.verification === 'unverified' ? 'openQuestions' : item.category,
+        intendedCategory: item.category, text: text(item.text, 'text'),
+        verification: item.verification, source, date,
+      };
+    });
+  }
+
+  detectConflicts(current, candidates) {
     const conflicts = [];
-    const clean = { constraints: [], decisions: [], results: [], openQuestions: [] };
-    let ci = 0;
-    for (const k of ['constraints', 'decisions', 'results', 'openQuestions']) {
-      for (const item of (patch[k] || [])) {
-        if (state[k].includes(item)) continue; // 精确重复：静默跳过，不冲突
-        const best = this.bestMatch(state[k], item);
-        if (best && best.score >= MERGE_CONFLICT_THRESHOLD) {
-          conflicts.push({ index: ci++, category: k, newText: item, existingIndex: best.index,
-            existingText: best.text, score: +best.score.toFixed(3), action: null, customText: null });
-        } else {
-          clean[k].push(item);
-        }
+    const clean = [];
+    for (const entry of candidates) {
+      const peers = current.filter(existing => existing.category === entry.category);
+      if (peers.some(existing => existing.text === entry.text)) continue;
+      const vector = tf(tokenize(entry.text));
+      let best;
+      for (const existing of peers) {
+        const score = cosine(vector, tf(tokenize(existing.text)));
+        if (score >= 0.5 && (!best || score > best.score)) best = { existing, score };
       }
+      if (best) conflicts.push({ index: conflicts.length, proposed: entry, ...best });
+      else clean.push(entry);
     }
-    return { meta, conclusion, clean, conflicts };
+    return { clean, conflicts };
   }
-  // 执行合并（写入 conclusion.md + 主线 state + 归档）。conflicts 里带 action/customText 的按决议处理
-  applyMerge(name, id, conclusion, clean, conflicts) {
-    const { meta } = this.getBranch(name, id);
-    const md = `# 支线结论：${meta.title}\n\n> 来源支线：${id}\n> 合并时间：${nowISO()}\n\n${conclusion}\n`;
-    fs.writeFileSync(path.join(this.branchDir(name, id), 'conclusion.md'), md);
-    const s = this.getMainline(name);
-    for (const k of ['constraints', 'decisions', 'results', 'openQuestions'])
-      for (const item of clean[k]) if (!s[k].includes(item)) s[k].push(item);
-    const applied = [];
-    for (const c of (conflicts || [])) {
-      const text = (c.customText && c.customText.trim()) ? c.customText.trim() : c.newText;
-      if (c.action === 'drop') { applied.push({ category: c.category, action: 'drop' }); continue; }
-      if (c.action === 'replace') {
-        if (c.existingIndex >= 0 && c.existingIndex < s[c.category].length) s[c.category][c.existingIndex] = text;
-        else if (!s[c.category].includes(text)) s[c.category].push(text);
-        applied.push({ category: c.category, action: 'replace', text });
-      } else { // keepBoth（默认）
-        if (!s[c.category].includes(text)) s[c.category].push(text);
-        applied.push({ category: c.category, action: 'keepBoth', text });
+
+  mergeBranch(name, id, proposal) {
+    const project = this.loadProject(name);
+    const branch = this.branch(project, id);
+    if (branch.status === 'archived') return { id, archived: true, alreadyMerged: true };
+    const candidates = this.proposedEntries(branch, proposal.summary, proposal.entries);
+    const { clean, conflicts } = this.detectConflicts(project.entries, candidates);
+    if (!conflicts.length) return this.applyMerge(project, branch, clean, []);
+    const pending = {
+      token: randomUUID(), state: digest([project.entries, project.baseline]), clean, conflicts,
+    };
+    this.save(project, { branch: { ...branch, pending } });
+    return { id, needsConfirmation: true, token: pending.token, conflicts };
+  }
+
+  resolveMerge(name, id, token, resolutions) {
+    const project = this.loadProject(name);
+    const branch = this.branch(project, id);
+    if (branch.status === 'archived') return { id, archived: true, alreadyMerged: true };
+    const pending = branch.pending;
+    if (!pending || pending.token !== token || pending.state !== digest([project.entries, project.baseline])) {
+      throw new Error('合并预览已失效，请重新预览并确认');
+    }
+    if (!Array.isArray(resolutions) || resolutions.length !== pending.conflicts.length) throw new Error('冲突决议不完整');
+    const actions = new Map();
+    for (const resolution of resolutions) {
+      if (!resolution || !Number.isInteger(resolution.index) || !pending.conflicts[resolution.index] ||
+          actions.has(resolution.index) || !['keepBoth', 'replace', 'drop'].includes(resolution.action)) {
+        throw new Error('冲突决议无效或重复');
       }
+      actions.set(resolution.index, resolution.action);
     }
-    this.saveMainline(name, s);
-    this.archiveBranch(name, id);
-    return { id, title: meta.title, conclusion, appliedClean: clean, appliedConflicts: applied, archived: true };
+    const conflicts = pending.conflicts.map(conflict => ({ ...conflict, action: actions.get(conflict.index) }));
+    const replacements = conflicts.filter(conflict => conflict.action === 'replace');
+    if (new Set(replacements.map(conflict => conflict.existing.id)).size !== replacements.length) {
+      throw new Error('同一条主线记录只能被替换一次');
+    }
+    return this.applyMerge(project, branch, pending.clean, conflicts);
   }
-  // 合并入口：检测到冲突且非强制 → 返回 needsConfirmation，不改动主线；否则直接合并
-  mergeBranch(name, id, summary, force = false) {
-    const det = this.detectMergeConflicts(name, id, summary);
-    if (det.conflicts.length && !force) {
-      return { needsConfirmation: true, branchId: id, title: det.meta.title, conclusion: det.conclusion,
-        conflicts: det.conflicts,
-        hint: '向用户逐条展示 conflicts（newText 与 existingText 对比），征询每项选择：keepBoth(保留两者) / replace(用 newText 覆盖 existingIndex 指向的旧项) / drop(丢弃新项)。然后用 mt_merge_resolve 提交决议。若 mt_merge 用了 summary 触发检测，resolve 时务必传相同 summary。' };
-    }
-    return this.applyMerge(name, id, det.conclusion, det.clean, det.conflicts);
-  }
-  // 用户确认后提交决议：resolutions = [{ index, action:'keepBoth'|'replace'|'drop', customText? }]
-  resolveMerge(name, id, resolutions, summary = null) {
-    const det = this.detectMergeConflicts(name, id, summary);
-    if (!det.conflicts.length) return this.applyMerge(name, id, det.conclusion, det.clean, []);
-    const map = new Map((resolutions || []).map(r => [r.index, r]));
-    if (det.conflicts.some(c => !map.has(c.index))) {
-      return { error: 'conflict_mismatch', message: '冲突项与上次检测不一致（支线可能已变动），请重新调用 mt_merge 获取最新 conflicts 再 resolve。' };
-    }
-    for (const c of det.conflicts) {
-      const r = map.get(c.index);
-      c.action = (r && r.action) || 'keepBoth';
-      c.customText = (r && r.customText) || null;
-    }
-    return this.applyMerge(name, id, det.conclusion, det.clean, det.conflicts);
-  }
-  // 启发式抽取：从支线事件里抓决策/结论/风险相关文本
-  heuristicExtract(events) {
-    const bullets = [];
-    for (const e of events) {
-      if (e.role !== 'assistant') continue;
-      const lines = String(e.text).split('\n');
-      for (const ln of lines) {
-        const t = ln.trim().replace(/^[-*]\s*/, '').replace(/^\d+\.\s*/, '');
-        if (/决定|结论|建议|结果|结论|方案|根因|修复|注意|风险|约束|必须|应当|不要/.test(t) && t.length > 6 && t.length < 300) bullets.push(t);
-      }
-    }
-    if (!bullets.length && events.length) {
-      const last = events[events.length - 1];
-      bullets.push(String(last.text).slice(0, 280));
-    }
-    const uniq = [...new Set(bullets)].slice(0, 12);
-    return '## 关键结论\n' + (uniq.length ? uniq.map(b => `- ${b}`).join('\n') : '- (支线未产出明确结论)') + '\n';
-  }
-  // 把结构化 markdown 解析为 constraints/decisions/results/openQuestions
-  // 支持「## 小节标题 + 下方 bullet」写法：标题决定后续 bullet 的归类，直到下一个 ##
-  parseStructured(md) {
-    const out = { constraints: [], decisions: [], results: [], openQuestions: [] };
-    const map = [
-      [/约束|constraint/i, 'constraints'], [/决策|决定|decision/i, 'decisions'],
-      [/结果|成果|result/i, 'results'], [/问题|疑问|待解|open/i, 'openQuestions']
-    ];
-    let cur = 'results'; // 默认归类
-    for (const ln of String(md).split('\n')) {
-      const head = ln.trim().match(/^#{1,3}\s*(.*)$/);
-      if (head) {
-        let matched = false;
-        for (const [re, key] of map) { if (re.test(head[1])) { cur = key; matched = true; break; } }
-        if (!matched) cur = 'results';
+
+  applyMerge(project, branch, clean, conflicts) {
+    const { pending, ...meta } = branch;
+    const accepted = [...clean];
+    const archivedEntries = [];
+    const replaced = new Set();
+    for (const { action, existing, proposed } of conflicts) {
+      if (action === 'drop') {
+        archivedEntries.push({ ...proposed, id: randomUUID(), branchId: branch.id, status: 'rejected' });
         continue;
       }
-      const m = ln.trim().match(/^[-*]\s+(.*)$/);
-      if (!m) continue;
-      const text = m[1].trim();
-      if (text) out[cur].push(text);
-    }
-    return out;
-  }
-
-  // ---------- Checkpoint： freezing 主线 → 复盘文档 → 新基线 ----------
-  checkpoint(name, title, reviewText) {
-    this.ensureProject(name);
-    const state = this.getMainline(name);
-    const id = rid('cp');
-    const review = reviewText || this.renderMainline(name, state);
-    const doc = `# Checkpoint：${title || id}\n\n> 项目：${name}\n> 冻结时间：${nowISO()}\n> Checkpoint ID：${id}\n\n` +
-      `## 复盘\n\n${review}\n\n---\n本 Checkpoint 已作为新基线。本阶段支线引用已清空，原始支线日志保留备查。\n`;
-    fs.writeFileSync(path.join(this.checkpointsDir(name), `${id}.md`), doc);
-    // 设为新基线，清空主线 openQuestions 之外的阶段性引用（保留结构化 state）
-    state.baselineCheckpoint = id;
-    this.saveMainline(name, state);
-    // 清空主线事件日志（最近对话），以 checkpoint 为新起点
-    const ep = this.mainlineEventsPath(name);
-    if (fs.existsSync(ep)) fs.writeFileSync(ep, '');
-    return { id, path: path.join(this.checkpointsDir(name), `${id}.md`), title: title || id };
-  }
-
-  // ---------- 闲聊分区：激进压缩 ----------
-  recordChat(project, role, text) {
-    const p = this.chatPath(project);
-    fs.mkdirSync(path.dirname(p), { recursive: true });
-    fs.appendFileSync(p, JSON.stringify({ t: nowISO(), role, text: String(text).slice(0, 2000) }) + '\n');
-    // 激进压缩：超过 20 条即压成一条摘要占位，细节丢弃（符合设计：闲聊可接受丢细节）
-    const lines = fs.readFileSync(p, 'utf8').split('\n').filter(Boolean);
-    if (lines.length > 20) {
-      const keep = lines.slice(-5);
-      const summary = `# 闲聊压缩摘要 @${nowISO()}\n前 ${lines.length - 5} 条闲聊已压缩丢弃（激进压缩策略）。近期 ${keep.length} 条保留。`;
-      fs.writeFileSync(p, summary + '\n' + keep.join('\n') + '\n');
-    }
-  }
-
-  // ---------- 上下文获取（主线：结构化 state + 最近少量主线对话）----------
-  getContext(name, maxRecent = 6) {
-    const state = this.getMainline(name);
-    const md = this.renderMainline(name, state);
-    let recent = '';
-    const ep = this.mainlineEventsPath(name);
-    if (fs.existsSync(ep)) {
-      const lines = fs.readFileSync(ep, 'utf8').split('\n').filter(Boolean).slice(-maxRecent);
-      if (lines.length) {
-        recent = '\n## 最近主线对话（仅少量，不滚动摘要）\n' +
-          lines.map(l => { try { const o = JSON.parse(l); return `- [${o.role}] ${o.text.slice(0, 300)}`; } catch { return ''; } }).filter(Boolean).join('\n');
+      accepted.push(proposed);
+      if (action === 'replace') {
+        replaced.add(existing.id);
+        archivedEntries.push({ ...existing, status: 'superseded' });
       }
     }
-    return md + recent + '\n\n> 注：支线原始日志默认不注入本上下文窗口；需合并请调用 mt_merge。';
+    const current = project.entries.filter(entry => !replaced.has(entry.id));
+    const addedEntries = [];
+    for (const proposed of accepted) {
+      if (![...current, ...addedEntries].some(entry => entry.category === proposed.category && entry.text === proposed.text)) {
+        addedEntries.push({ ...proposed, id: randomUUID(), branchId: branch.id, status: 'current' });
+      }
+    }
+    const archived = { ...meta, status: 'archived', archivedAt: new Date().toISOString() };
+    this.save(project, { addedEntries, removedIds: [...replaced], archivedEntries, branch: archived });
+    return { id: branch.id, archived: true, decisions: conflicts.map(({ index, action }) => ({ index, action })) };
   }
 
-  // ---------- 语义检索（轻量本地向量，零依赖，覆盖全部项目记忆）----------
-  // 检索范围：主线结构化条目 + 各支线结论(conclusion.md) + 各 Checkpoint 复盘全文
-  semanticSearch(query, topK = 5, project = null) {
-    const idx = new SemanticIndex();
-    const projects = Object.keys(this.config.projects);
-    for (const p of projects) {
-      if (project && p !== project) continue;
-      const s = this.getMainline(p);
-      for (const k of ['constraints', 'decisions', 'results', 'openQuestions'])
-        s[k].forEach((item, i) => idx.add(`main:${p}:${k}:${i}`, p, k, 'mainline', item));
-      // 支线结论
-      const bd = this.branchesDir(p);
-      if (fs.existsSync(bd)) for (const d of fs.readdirSync(bd)) {
-        const cp = path.join(bd, d, 'conclusion.md');
-        if (!fs.existsSync(cp)) continue;
-        for (const ln of fs.readFileSync(cp, 'utf8').split('\n')) {
-          const t = ln.trim().replace(/^[-*]\s*/, '');
-          if (t && !ln.startsWith('#') && !ln.startsWith('>') && t.length > 4) idx.add(`branch:${p}:${d}`, p, 'conclusion', `branch:${d}`, t);
+  checkpoint(name, title = '阶段快照', review = '') {
+    const project = this.loadProject(name);
+    const id = `cp-${randomUUID()}`;
+    const checkpoint = {
+      id, title: text(title, 'title', 200), created: new Date().toISOString(),
+      review: review === '' ? '' : text(review, 'review', 16000),
+      entries: project.entries, previousBaseline: project.baseline,
+    };
+    this.save(project, { checkpoint });
+    return { id, title: checkpoint.title, project: project.name };
+  }
+
+  getCheckpoint(name, id) {
+    const project = this.loadProject(name);
+    const checkpoint = project.checkpoints.get(id);
+    if (checkpoint) return {
+      id, title: checkpoint.title, created: checkpoint.created, previousBaseline: checkpoint.previousBaseline,
+      markdown: [`# ${checkpoint.title}`, checkpoint.review, this.render({
+        ...project, entries: checkpoint.entries, baseline: checkpoint.previousBaseline,
+      })].filter(Boolean).join('\n\n'),
+    };
+    if (typeof id !== 'string' || !/^cp-[a-f0-9]{8}$/.test(id)) throw new Error('快照不存在');
+    const markdown = readText(path.join(project.dir, 'checkpoints', `${id}.md`));
+    if (!markdown) throw new Error('快照不存在');
+    return { id, markdown };
+  }
+
+  recordChat(name, role, message) {
+    const project = this.loadProject(name);
+    if (!['user', 'assistant'].includes(role)) throw new Error('role 必须是 user 或 assistant');
+    const chatDir = path.join(project.dir, 'chat');
+    ensureDirectory(chatDir);
+    const content = JSON.stringify({ role, text: text(message, 'message', 2000), time: new Date().toISOString() });
+    publish(path.join(chatDir, `${Date.now()}-${randomUUID()}.json`), content);
+    const files = list(chatDir).filter(entry => entry.isFile() && /^\d+-[a-f0-9-]{36}\.json$/.test(entry.name))
+      .map(entry => entry.name).sort();
+    for (const old of files.slice(0, -20)) {
+      try {
+        fs.unlinkSync(path.join(chatDir, old));
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+    }
+    return { stored: true };
+  }
+
+  projectNames() {
+    return list(this.root).filter(entry => entry.isDirectory() && !entry.name.startsWith('.'))
+      .map(entry => entry.name).filter(name => this.loadProject(name, false).exists);
+  }
+
+  search(query, { project, scope, includeHistorical = false, topK = 5 } = {}) {
+    text(query, 'query', 2000);
+    if (!Number.isInteger(topK) || topK < 1 || topK > 50) throw new Error('topK 必须是 1–50 的整数');
+    if (typeof includeHistorical !== 'boolean' || (scope !== undefined && scope !== 'all') ||
+        (scope === 'all') === (project !== undefined)) throw new Error('请指定 project，或使用 scope: all 进行跨项目检索');
+    const index = new SemanticIndex();
+    const metadata = new Map();
+    for (const name of scope === 'all' ? this.projectNames() : [project]) {
+      const snapshot = this.loadProject(name);
+      const records = [...snapshot.entries];
+      if (includeHistorical) {
+        records.push(...snapshot.archivedEntries);
+        for (const checkpoint of snapshot.checkpoints.values()) {
+          for (const entry of checkpoint.entries) records.push({
+            ...entry, id: `${checkpoint.id}:${entry.id}`, source: checkpoint.id, status: 'checkpoint',
+          });
+          markdownLines(checkpoint.review).forEach((value, line) => records.push({
+            id: `${checkpoint.id}:review:${line}`, text: value, source: checkpoint.id,
+            status: 'checkpoint', verification: 'unverified',
+          }));
         }
+        this.addLegacyHistory(snapshot, records);
       }
-      // Checkpoint 复盘
-      const cd = this.checkpointsDir(p);
-      if (fs.existsSync(cd)) for (const f of fs.readdirSync(cd).filter(f => f.endsWith('.md'))) {
-        for (const ln of fs.readFileSync(path.join(cd, f), 'utf8').split('\n')) {
-          const t = ln.trim().replace(/^[-*]\s*/, '');
-          if (t && !ln.startsWith('#') && !ln.startsWith('>') && t.length > 4) idx.add(`cp:${p}:${f}`, p, 'checkpoint', f, t);
-        }
+      for (const { id, category, source, text: value, ...details } of records) {
+        metadata.set(`${name}:${id}`, details);
+        index.add(id, name, category, source ?? 'mainline', value);
       }
     }
-    return idx.search(query, topK, project);
+    return index.search(query, topK).map(hit => {
+      const details = metadata.get(`${hit.project}:${hit.id}`);
+      return { ...hit, ...details, historical: details.status !== 'current', text: hit.text.slice(0, 1200) };
+    });
   }
 
-  // ---------- 状态总览 ----------
-  status() {
-    const active = this.config.activeProject || this.config.defaultProject;
-    const branches = this.listBranches(active).filter(b => b.status === 'active');
-    const s = this.getMainline(active);
+  addLegacyHistory(project, records) {
+    for (const branch of project.branches.values()) {
+      if (!branch.legacy || branch.status !== 'archived') continue;
+      const file = path.join(project.dir, 'branches', branch.id, 'conclusion.md');
+      markdownLines(readText(file)).forEach((value, index) => records.push({
+        id: `${branch.id}:${index}`, text: value, source: branch.id, status: 'legacy', verification: 'legacy',
+      }));
+    }
+    const directory = path.join(project.dir, 'checkpoints');
+    ensureDirectory(directory);
+    for (const file of list(directory)) {
+      if (!file.isFile() || !/^cp-[a-f0-9]{8}\.md$/.test(file.name)) continue;
+      markdownLines(readText(path.join(directory, file.name))).forEach((value, index) => records.push({
+        id: `${file.name}:${index}`, text: value, source: file.name, status: 'legacy', verification: 'legacy',
+      }));
+    }
+  }
+
+  status(name) {
+    if (name === undefined) return { activeProject: this.activeProject, projects: this.projectNames() };
+    const project = this.loadProject(name);
     return {
-      activeProject: active,
-      mainline: { constraints: s.constraints.length, decisions: s.decisions.length,
-        results: s.results.length, openQuestions: s.openQuestions.length, baseline: s.baselineCheckpoint },
-      activeBranches: branches.map(b => ({ id: b.id, title: b.title, created: b.created })),
-      routing: { idleWords: this.config.routing.idleWords.length, projectWords: this.config.routing.projectWords.length }
+      project: project.name, revision: project.revision, baseline: project.baseline,
+      mainline: Object.fromEntries(KEYS.map(key => [key, project.entries.filter(item => item.category === key).length])),
+      activeBranches: [...project.branches.values()].filter(branch => branch.status === 'active')
+        .map(({ id, title }) => ({ id, title })),
     };
   }
 }
